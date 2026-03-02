@@ -1,0 +1,9 @@
+*.o
+*.so
+kernel/clawd
+init/claw-init
+bus/claw-bus
+openclaw/openclaw-runtime
+cli/claw
+*/obj/
+*.img
