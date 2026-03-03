@@ -13,6 +13,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <poll.h>
@@ -131,7 +132,8 @@ int claw_ipc_request(struct claw_ipc *ipc, claw_aid_t dst,
         return CLAW_ERR_NOMEM;
 
     memset(msg, 0, sizeof(struct claw_msg));
-    msg->id = __sync_fetch_and_add(&next_mid, 1);
+    claw_mid_t req_id = __sync_fetch_and_add(&next_mid, 1);
+    msg->id = req_id;
     msg->type = CLAW_MSG_REQUEST;
     msg->src = ipc->self_id;
     msg->dst = dst;
@@ -145,20 +147,47 @@ int claw_ipc_request(struct claw_ipc *ipc, claw_aid_t dst,
     if (rc != CLAW_OK)
         return rc;
 
-    /* Wait for response */
+    /*
+     * Wait for a response that matches our request ID.
+     * This prevents mismatched responses when multiple requests
+     * are in flight. Non-matching messages are discarded -
+     * in practice, agents should use separate IPC contexts for
+     * concurrent request/response and event listening.
+     */
     struct claw_msg *resp = malloc(CLAW_MAX_MSG_SIZE);
     if (!resp)
         return CLAW_ERR_NOMEM;
 
-    rc = claw_ipc_recv(ipc, resp, timeout_ms);
-    if (rc == CLAW_OK && reply && reply_len) {
-        uint32_t copy_len = resp->len < *reply_len ? resp->len : *reply_len;
-        memcpy(reply, resp->data, copy_len);
-        *reply_len = copy_len;
-    }
-    free(resp);
+    int remaining_ms = timeout_ms;
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
 
-    return rc;
+    while (remaining_ms > 0) {
+        rc = claw_ipc_recv(ipc, resp, remaining_ms);
+        if (rc != CLAW_OK)
+            break;
+
+        /* Check if this response matches our request */
+        if (resp->type == CLAW_MSG_RESPONSE && resp->id == req_id) {
+            if (reply && reply_len) {
+                uint32_t copy_len = resp->len < *reply_len
+                                    ? resp->len : *reply_len;
+                memcpy(reply, resp->data, copy_len);
+                *reply_len = copy_len;
+            }
+            free(resp);
+            return CLAW_OK;
+        }
+
+        /* Not our response - update remaining time and retry */
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int elapsed_ms = (now.tv_sec - start.tv_sec) * 1000 +
+                         (now.tv_nsec - start.tv_nsec) / 1000000;
+        remaining_ms = timeout_ms - elapsed_ms;
+    }
+
+    free(resp);
+    return rc == CLAW_OK ? CLAW_ERR_BUSY : rc; /* timeout */
 }
 
 int claw_ipc_emit(struct claw_ipc *ipc, const char *topic,
