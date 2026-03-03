@@ -1,0 +1,31 @@
+# System Monitor Agent - Example manifest
+# Monitors system health and publishes metrics to the bus
+
+[agent]
+name = "system-monitor"
+version = "0.1.0"
+description = "System health monitoring agent"
+exec = "/usr/lib/claw/agents/system-monitor"
+
+[resources]
+memory = "64M"
+cpu_shares = 50
+
+[capabilities]
+net = false
+fs = true
+ipc = true
+openclaw = true
+bus = true
+
+[lifecycle]
+auto_start = true
+restart_on_failure = true
+max_restarts = 10
+
+[bus]
+subscribe = "system.query"
+
+[environment]
+CHECK_INTERVAL = "30"
+LOG_LEVEL = "info"
