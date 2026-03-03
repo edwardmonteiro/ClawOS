@@ -22,7 +22,15 @@ struct claw_subscription {
     char        topic[CLAW_MAX_NAME];
     int         fd;       /* client socket fd */
     int         active;
+    int         next;     /* next index in hash chain, -1 = end */
 };
+
+/*
+ * Topic hash index.
+ * Maps topic strings to chains of subscription indices.
+ * Uses FNV-1a hash with open chaining for collision handling.
+ */
+#define CLAW_BUS_HASH_BUCKETS  256
 
 /* Bus context */
 struct claw_bus {
@@ -31,6 +39,8 @@ struct claw_bus {
     int                      epoll_fd;
     struct claw_subscription subs[CLAW_MAX_TOPICS];
     int                      sub_count;
+    int                      topic_heads[CLAW_BUS_HASH_BUCKETS]; /* hash chain heads */
+    int                      wildcard_head; /* chain of empty-topic (match-all) subs */
 };
 
 /* Bus daemon operations */

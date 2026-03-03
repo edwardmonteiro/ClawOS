@@ -121,15 +121,31 @@ int claw_ipc_connect(struct claw_ipc *ipc, const char *target)
     return CLAW_OK;
 }
 
+/*
+ * Maximum payload size for stack-allocated messages.
+ * Covers the vast majority of IPC: resolve requests, short commands,
+ * status queries. Only large data transfers fall back to malloc.
+ */
+#define CLAW_IPC_STACK_MAX  4096
+
 int claw_ipc_request(struct claw_ipc *ipc, claw_aid_t dst,
                      const char *topic, const void *data, uint32_t len,
                      void *reply, uint32_t *reply_len, int timeout_ms)
 {
-    /* Allocate message with data */
+    /* Use stack for small messages, heap for large ones */
     size_t msg_size = sizeof(struct claw_msg) + len;
-    struct claw_msg *msg = malloc(msg_size);
-    if (!msg)
-        return CLAW_ERR_NOMEM;
+    char stack_msg[sizeof(struct claw_msg) + CLAW_IPC_STACK_MAX];
+    struct claw_msg *msg;
+    int heap_msg = 0;
+
+    if (len <= CLAW_IPC_STACK_MAX) {
+        msg = (struct claw_msg *)stack_msg;
+    } else {
+        msg = malloc(msg_size);
+        if (!msg)
+            return CLAW_ERR_NOMEM;
+        heap_msg = 1;
+    }
 
     memset(msg, 0, sizeof(struct claw_msg));
     claw_mid_t req_id = __sync_fetch_and_add(&next_mid, 1);
@@ -143,20 +159,17 @@ int claw_ipc_request(struct claw_ipc *ipc, claw_aid_t dst,
         memcpy(msg->data, data, len);
 
     int rc = claw_ipc_send(ipc, msg);
-    free(msg);
+    if (heap_msg)
+        free(msg);
     if (rc != CLAW_OK)
         return rc;
 
     /*
      * Wait for a response that matches our request ID.
-     * This prevents mismatched responses when multiple requests
-     * are in flight. Non-matching messages are discarded -
-     * in practice, agents should use separate IPC contexts for
-     * concurrent request/response and event listening.
+     * Uses a stack-allocated buffer for the response too.
      */
-    struct claw_msg *resp = malloc(CLAW_MAX_MSG_SIZE);
-    if (!resp)
-        return CLAW_ERR_NOMEM;
+    char resp_buf[CLAW_MAX_MSG_SIZE];
+    struct claw_msg *resp = (struct claw_msg *)resp_buf;
 
     int remaining_ms = timeout_ms;
     struct timespec start, now;
@@ -175,18 +188,16 @@ int claw_ipc_request(struct claw_ipc *ipc, claw_aid_t dst,
                 memcpy(reply, resp->data, copy_len);
                 *reply_len = copy_len;
             }
-            free(resp);
             return CLAW_OK;
         }
 
-        /* Not our response - update remaining time and retry */
+        /* Not our response — update remaining time and retry */
         clock_gettime(CLOCK_MONOTONIC, &now);
         int elapsed_ms = (now.tv_sec - start.tv_sec) * 1000 +
                          (now.tv_nsec - start.tv_nsec) / 1000000;
         remaining_ms = timeout_ms - elapsed_ms;
     }
 
-    free(resp);
     return rc == CLAW_OK ? CLAW_ERR_BUSY : rc; /* timeout */
 }
 
@@ -194,9 +205,18 @@ int claw_ipc_emit(struct claw_ipc *ipc, const char *topic,
                   const void *data, uint32_t len)
 {
     size_t msg_size = sizeof(struct claw_msg) + len;
-    struct claw_msg *msg = malloc(msg_size);
-    if (!msg)
-        return CLAW_ERR_NOMEM;
+    char stack_msg[sizeof(struct claw_msg) + CLAW_IPC_STACK_MAX];
+    struct claw_msg *msg;
+    int heap = 0;
+
+    if (len <= CLAW_IPC_STACK_MAX) {
+        msg = (struct claw_msg *)stack_msg;
+    } else {
+        msg = malloc(msg_size);
+        if (!msg)
+            return CLAW_ERR_NOMEM;
+        heap = 1;
+    }
 
     memset(msg, 0, sizeof(struct claw_msg));
     msg->id = __sync_fetch_and_add(&next_mid, 1);
@@ -209,6 +229,7 @@ int claw_ipc_emit(struct claw_ipc *ipc, const char *topic,
         memcpy(msg->data, data, len);
 
     int rc = claw_ipc_send(ipc, msg);
-    free(msg);
+    if (heap)
+        free(msg);
     return rc;
 }

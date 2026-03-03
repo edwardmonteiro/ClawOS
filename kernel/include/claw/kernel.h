@@ -20,11 +20,14 @@
 #define CLAWD_EXT_DIR        "/usr/lib/claw/extensions"
 #define CLAWD_CGROUP_ROOT    "/sys/fs/cgroup/claw"
 
+#define CLAW_MAX_CLIENTS     256   /* max concurrent kernel connections */
+
 /* Kernel context */
 struct claw_kernel {
     int                     running;
     int                     sock_fd;
     int                     epoll_fd;
+    int                     fwd_fd;          /* cached DGRAM socket for forwarding */
     struct claw_agent       agents[CLAW_MAX_AGENTS];
     int                     agent_count;
     struct claw_extension   extensions[CLAW_MAX_EXTENSIONS];

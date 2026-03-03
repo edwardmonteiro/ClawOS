@@ -37,11 +37,30 @@ static void signal_handler(int sig)
     got_signal = 1;
 }
 
+/*
+ * FNV-1a hash for topic strings.
+ * Simple, fast, good distribution for short strings.
+ */
+static unsigned int topic_hash(const char *s)
+{
+    unsigned int h = 2166136261u;
+    for (; *s; s++) {
+        h ^= (unsigned char)*s;
+        h *= 16777619u;
+    }
+    return h & (CLAW_BUS_HASH_BUCKETS - 1);
+}
+
 int claw_bus_init(struct claw_bus *bus)
 {
     struct sockaddr_un addr;
 
     memset(bus, 0, sizeof(*bus));
+
+    /* Initialize hash chains to empty (-1) */
+    for (int i = 0; i < CLAW_BUS_HASH_BUCKETS; i++)
+        bus->topic_heads[i] = -1;
+    bus->wildcard_head = -1;
 
     bus->sock_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (bus->sock_fd < 0)
@@ -81,13 +100,24 @@ static int add_subscription(struct claw_bus *bus, const char *topic,
     if (bus->sub_count >= CLAW_MAX_TOPICS)
         return -1;
 
-    struct claw_subscription *sub = &bus->subs[bus->sub_count];
+    int idx = bus->sub_count;
+    struct claw_subscription *sub = &bus->subs[idx];
     sub->agent_id = agent_id;
     strncpy(sub->topic, topic, CLAW_MAX_NAME - 1);
     sub->fd = fd;
     sub->active = 1;
-    bus->sub_count++;
 
+    /* Insert into hash chain */
+    if (topic[0] == '\0') {
+        sub->next = bus->wildcard_head;
+        bus->wildcard_head = idx;
+    } else {
+        unsigned int h = topic_hash(topic);
+        sub->next = bus->topic_heads[h];
+        bus->topic_heads[h] = idx;
+    }
+
+    bus->sub_count++;
     fprintf(stderr, "[claw-bus] agent %lu subscribed to '%s'\n",
             agent_id, topic);
     return 0;
@@ -96,42 +126,83 @@ static int add_subscription(struct claw_bus *bus, const char *topic,
 static void remove_subscription(struct claw_bus *bus, const char *topic,
                                claw_aid_t agent_id)
 {
-    for (int i = 0; i < bus->sub_count; i++) {
-        if (bus->subs[i].agent_id == agent_id &&
-            strcmp(bus->subs[i].topic, topic) == 0) {
-            bus->subs[i].active = 0;
+    /* Mark inactive. We don't remove from the hash chain —
+       inactive entries are skipped during delivery. Chains are
+       compacted lazily or on next full rebuild if needed. */
+    unsigned int h = topic_hash(topic);
+    int idx = bus->topic_heads[h];
+    while (idx >= 0) {
+        if (bus->subs[idx].agent_id == agent_id &&
+            strcmp(bus->subs[idx].topic, topic) == 0) {
+            bus->subs[idx].active = 0;
             fprintf(stderr, "[claw-bus] agent %lu unsubscribed from '%s'\n",
                     agent_id, topic);
             return;
         }
+        idx = bus->subs[idx].next;
     }
 }
 
+/*
+ * Deliver a message to a chain of subscribers.
+ * Walks the linked list starting at `head`, sending to each
+ * active subscriber that isn't the sender.
+ */
+static void deliver_chain(struct claw_bus *bus, int head,
+                          const struct claw_msg *msg, size_t total)
+{
+    int idx = head;
+    while (idx >= 0) {
+        struct claw_subscription *sub = &bus->subs[idx];
+        int next = sub->next;
+
+        if (sub->active && sub->agent_id != msg->src) {
+            ssize_t n = send(sub->fd, msg, total, MSG_NOSIGNAL);
+            if (n < 0)
+                sub->active = 0;
+        }
+
+        idx = next;
+    }
+}
+
+/*
+ * Deliver a published message to matching subscribers.
+ *
+ * Instead of scanning all 1024 subscription slots, this uses the
+ * topic hash index to jump directly to the chain of subscribers
+ * for the published topic. Wildcard subscribers (empty topic) are
+ * delivered separately.
+ *
+ * Cost: O(matching_subs + wildcard_subs) instead of O(all_subs).
+ */
 static void deliver_to_subscribers(struct claw_bus *bus,
                                   const struct claw_msg *msg)
 {
     size_t total = sizeof(struct claw_msg) + msg->len;
 
-    for (int i = 0; i < bus->sub_count; i++) {
-        if (!bus->subs[i].active)
-            continue;
+    /* Deliver to topic-specific subscribers */
+    if (msg->topic[0] != '\0') {
+        unsigned int h = topic_hash(msg->topic);
+        int idx = bus->topic_heads[h];
+        while (idx >= 0) {
+            struct claw_subscription *sub = &bus->subs[idx];
+            int next = sub->next;
 
-        /* Match topic - empty topic matches all */
-        if (bus->subs[i].topic[0] != '\0' &&
-            strcmp(bus->subs[i].topic, msg->topic) != 0)
-            continue;
+            /* Hash collision: verify exact topic match */
+            if (sub->active && sub->agent_id != msg->src &&
+                strcmp(sub->topic, msg->topic) == 0) {
+                ssize_t n = send(sub->fd, msg, total, MSG_NOSIGNAL);
+                if (n < 0)
+                    sub->active = 0;
+            }
 
-        /* Don't send back to sender */
-        if (bus->subs[i].agent_id == msg->src)
-            continue;
-
-        /* Deliver */
-        ssize_t n = send(bus->subs[i].fd, msg, total, MSG_NOSIGNAL);
-        if (n < 0) {
-            /* Client disconnected */
-            bus->subs[i].active = 0;
+            idx = next;
         }
     }
+
+    /* Deliver to wildcard subscribers (empty topic = match all) */
+    deliver_chain(bus, bus->wildcard_head, msg, total);
 }
 
 static void handle_bus_client(struct claw_bus *bus, int client_fd)
@@ -241,21 +312,30 @@ int claw_bus_connect(void)
     return fd;
 }
 
+/*
+ * Stack-allocated bus message construction.
+ * Topic names are always < 64 bytes, so subscribe/unsubscribe
+ * never needs heap allocation. Publish uses the stack for
+ * payloads up to 4KB.
+ */
+#define CLAW_BUS_STACK_MAX  4096
+
 int claw_bus_subscribe(int bus_fd, const char *topic, claw_aid_t agent_id)
 {
     size_t topic_len = strlen(topic);
     size_t msg_size = sizeof(struct claw_msg) + topic_len + 1;
-    struct claw_msg *msg = calloc(1, msg_size);
-    if (!msg) return -1;
+    char buf[sizeof(struct claw_msg) + CLAW_MAX_NAME];
+    struct claw_msg *msg = (struct claw_msg *)buf;
 
+    memset(msg, 0, sizeof(struct claw_msg));
     msg->type = CLAW_MSG_REQUEST;
     msg->src = agent_id;
     strncpy(msg->topic, "bus.subscribe", CLAW_MAX_NAME - 1);
     msg->len = topic_len + 1;
     memcpy(msg->data, topic, topic_len);
+    msg->data[topic_len] = '\0';
 
     ssize_t n = write(bus_fd, msg, msg_size);
-    free(msg);
     return n > 0 ? 0 : -1;
 }
 
@@ -263,17 +343,18 @@ int claw_bus_unsubscribe(int bus_fd, const char *topic, claw_aid_t agent_id)
 {
     size_t topic_len = strlen(topic);
     size_t msg_size = sizeof(struct claw_msg) + topic_len + 1;
-    struct claw_msg *msg = calloc(1, msg_size);
-    if (!msg) return -1;
+    char buf[sizeof(struct claw_msg) + CLAW_MAX_NAME];
+    struct claw_msg *msg = (struct claw_msg *)buf;
 
+    memset(msg, 0, sizeof(struct claw_msg));
     msg->type = CLAW_MSG_REQUEST;
     msg->src = agent_id;
     strncpy(msg->topic, "bus.unsubscribe", CLAW_MAX_NAME - 1);
     msg->len = topic_len + 1;
     memcpy(msg->data, topic, topic_len);
+    msg->data[topic_len] = '\0';
 
     ssize_t n = write(bus_fd, msg, msg_size);
-    free(msg);
     return n > 0 ? 0 : -1;
 }
 
@@ -281,9 +362,19 @@ int claw_bus_publish(int bus_fd, const char *topic,
                      const void *data, uint32_t len)
 {
     size_t msg_size = sizeof(struct claw_msg) + len;
-    struct claw_msg *msg = calloc(1, msg_size);
-    if (!msg) return -1;
+    char stack_buf[sizeof(struct claw_msg) + CLAW_BUS_STACK_MAX];
+    struct claw_msg *msg;
+    int heap = 0;
 
+    if (len <= CLAW_BUS_STACK_MAX) {
+        msg = (struct claw_msg *)stack_buf;
+    } else {
+        msg = calloc(1, msg_size);
+        if (!msg) return -1;
+        heap = 1;
+    }
+
+    memset(msg, 0, sizeof(struct claw_msg));
     msg->type = CLAW_MSG_EVENT;
     strncpy(msg->topic, topic, CLAW_MAX_NAME - 1);
     msg->len = len;
@@ -291,7 +382,8 @@ int claw_bus_publish(int bus_fd, const char *topic,
         memcpy(msg->data, data, len);
 
     ssize_t n = write(bus_fd, msg, msg_size);
-    free(msg);
+    if (heap)
+        free(msg);
     return n > 0 ? 0 : -1;
 }
 

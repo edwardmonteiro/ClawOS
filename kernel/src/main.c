@@ -100,16 +100,34 @@ static void ensure_dirs(void)
 }
 
 /*
+ * Maximum payload for stack-allocated responses.
+ * Covers resolve (8 bytes), errors (~32 bytes), ready ("ok").
+ * Only messages exceeding this fall back to heap allocation.
+ */
+#define CLAW_RESP_STACK_MAX  512
+
+/*
  * Send a response back to the requesting client.
- * Used for kernel-handled requests (resolve, agent.create, etc.)
+ * Uses a stack buffer for small responses (the common case),
+ * avoiding heap allocation entirely in the hot path.
  */
 static int send_response(int client_fd, const struct claw_msg *req,
                          const void *data, uint32_t len)
 {
     size_t total = sizeof(struct claw_msg) + len;
-    struct claw_msg *resp = calloc(1, total);
-    if (!resp)
-        return CLAW_ERR_NOMEM;
+    char stack_buf[sizeof(struct claw_msg) + CLAW_RESP_STACK_MAX];
+    struct claw_msg *resp;
+    int heap = 0;
+
+    if (len <= CLAW_RESP_STACK_MAX) {
+        resp = (struct claw_msg *)stack_buf;
+        memset(resp, 0, sizeof(struct claw_msg));
+    } else {
+        resp = calloc(1, total);
+        if (!resp)
+            return CLAW_ERR_NOMEM;
+        heap = 1;
+    }
 
     resp->id = req->id;
     resp->type = CLAW_MSG_RESPONSE;
@@ -121,7 +139,8 @@ static int send_response(int client_fd, const struct claw_msg *req,
         memcpy(resp->data, data, len);
 
     ssize_t n = write(client_fd, resp, total);
-    free(resp);
+    if (heap)
+        free(resp);
     return n > 0 ? CLAW_OK : CLAW_ERR_IO;
 }
 
@@ -135,32 +154,30 @@ static void send_error(int client_fd, const struct claw_msg *req,
 }
 
 /*
- * Forward a message from the kernel socket to an agent's IPC socket.
- * The kernel acts as the router: it resolves the destination agent's
- * datagram socket path and delivers the message there.
+ * Forward a message to an agent's IPC datagram socket.
+ *
+ * Uses the kernel's cached DGRAM socket (k->fwd_fd) instead of
+ * creating/destroying a socket per message. This eliminates 2
+ * syscalls (socket + close) per forwarded message — down to a
+ * single sendto().
  */
-static int forward_to_agent(const struct claw_agent *dst,
+static int forward_to_agent(struct claw_kernel *k,
+                            const struct claw_agent *dst,
                             const struct claw_msg *msg, size_t msg_total)
 {
     struct sockaddr_un addr;
     char dst_path[CLAW_MAX_PATH];
-    int fd;
     ssize_t n;
 
     snprintf(dst_path, sizeof(dst_path),
              "%s/%lu.sock", CLAW_IPC_SOCKET_DIR, dst->id);
 
-    fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-    if (fd < 0)
-        return CLAW_ERR_IO;
-
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, dst_path, sizeof(addr.sun_path) - 1);
 
-    n = sendto(fd, msg, msg_total, 0,
+    n = sendto(k->fwd_fd, msg, msg_total, 0,
                (struct sockaddr *)&addr, sizeof(addr));
-    close(fd);
 
     return n > 0 ? CLAW_OK : CLAW_ERR_IO;
 }
@@ -246,25 +263,17 @@ static void handle_agent_ready(struct claw_kernel *k, int client_fd,
     send_response(client_fd, msg, "ok", 3);
 }
 
-static void handle_client(struct claw_kernel *k, int client_fd)
+/*
+ * Dispatch a single message from a client connection.
+ * Returns 0 to keep the connection open, -1 to close it.
+ *
+ * The connection is NOT closed here — clients can send multiple
+ * messages over a persistent connection, eliminating the TCP
+ * handshake overhead per message.
+ */
+static int dispatch_message(struct claw_kernel *k, int client_fd,
+                            struct claw_msg *msg, size_t msg_total)
 {
-    char buf[CLAW_MAX_MSG_SIZE];
-    ssize_t n;
-
-    n = read(client_fd, buf, sizeof(buf));
-    if (n <= 0) {
-        close(client_fd);
-        return;
-    }
-
-    if ((size_t)n < sizeof(struct claw_msg)) {
-        close(client_fd);
-        return;
-    }
-
-    struct claw_msg *msg = (struct claw_msg *)buf;
-    size_t msg_total = sizeof(struct claw_msg) + msg->len;
-
     switch (msg->type) {
     case CLAW_MSG_REQUEST:
         claw_log(CLAW_LOG_DEBUG, "request from agent %lu: %s",
@@ -278,14 +287,13 @@ static void handle_client(struct claw_kernel *k, int client_fd)
         } else if (strcmp(msg->topic, "agent.ready") == 0) {
             handle_agent_ready(k, client_fd, msg);
         } else if (msg->dst != 0) {
-            /* Route to destination agent */
             struct claw_agent *dst = claw_agent_find(k, msg->dst);
             if (!dst || dst->state == CLAW_AGENT_DEAD) {
                 claw_log(CLAW_LOG_WARN, "route failed: agent %lu not found",
                          msg->dst);
                 send_error(client_fd, msg, "agent not found");
             } else {
-                int rc = forward_to_agent(dst, msg, msg_total);
+                int rc = forward_to_agent(k, dst, msg, msg_total);
                 if (rc != CLAW_OK) {
                     claw_log(CLAW_LOG_WARN,
                              "route failed: cannot reach agent %s",
@@ -304,12 +312,10 @@ static void handle_client(struct claw_kernel *k, int client_fd)
     case CLAW_MSG_EVENT:
         claw_log(CLAW_LOG_DEBUG, "event from agent %lu: %s",
                  msg->src, msg->topic);
-        /* Forward events to the destination if specified, or ignore
-           (bus handles broadcast events, kernel handles point-to-point) */
         if (msg->dst != 0) {
             struct claw_agent *dst = claw_agent_find(k, msg->dst);
             if (dst && dst->state != CLAW_AGENT_DEAD)
-                forward_to_agent(dst, msg, msg_total);
+                forward_to_agent(k, dst, msg, msg_total);
         }
         break;
 
@@ -318,7 +324,7 @@ static void handle_client(struct claw_kernel *k, int client_fd)
         if (msg->dst != 0) {
             struct claw_agent *dst = claw_agent_find(k, msg->dst);
             if (dst && dst->state != CLAW_AGENT_DEAD)
-                forward_to_agent(dst, msg, msg_total);
+                forward_to_agent(k, dst, msg, msg_total);
         }
         break;
 
@@ -327,6 +333,37 @@ static void handle_client(struct claw_kernel *k, int client_fd)
         break;
     }
 
+    return 0;
+}
+
+/*
+ * Read and handle data from a persistent client connection.
+ * Returns -1 if the connection should be closed (EOF or error).
+ */
+static int handle_client_data(struct claw_kernel *k, int client_fd)
+{
+    char buf[CLAW_MAX_MSG_SIZE];
+    ssize_t n;
+
+    n = read(client_fd, buf, sizeof(buf));
+    if (n <= 0)
+        return -1;  /* EOF or error — caller will close */
+
+    if ((size_t)n < sizeof(struct claw_msg))
+        return -1;  /* malformed — drop connection */
+
+    struct claw_msg *msg = (struct claw_msg *)buf;
+    size_t msg_total = sizeof(struct claw_msg) + msg->len;
+
+    return dispatch_message(k, client_fd, msg, msg_total);
+}
+
+/*
+ * Remove a client fd from epoll and close it.
+ */
+static void close_client(struct claw_kernel *k, int client_fd)
+{
+    epoll_ctl(k->epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
     close(client_fd);
 }
 
@@ -339,6 +376,7 @@ int claw_kernel_init(struct claw_kernel *k, const char *config)
     memset(k, 0, sizeof(*k));
     k->running = 0;
     k->log_level = CLAW_LOG_INFO;
+    k->fwd_fd = -1;
 
     if (config)
         strncpy(k->config_path, config, sizeof(k->config_path) - 1);
@@ -360,6 +398,16 @@ int claw_kernel_init(struct claw_kernel *k, const char *config)
         claw_log(CLAW_LOG_ERROR, "failed to create epoll: %s",
                  strerror(errno));
         return rc;
+    }
+
+    /* Create a persistent DGRAM socket for message forwarding.
+       This socket is reused across all forward_to_agent() calls,
+       eliminating socket()+close() per routed message. */
+    k->fwd_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (k->fwd_fd < 0) {
+        claw_log(CLAW_LOG_ERROR, "failed to create forwarding socket: %s",
+                 strerror(errno));
+        return CLAW_ERR_IO;
     }
 
     claw_log(CLAW_LOG_INFO, "clawd v%s initialized", CLAWD_VERSION_STRING);
@@ -390,11 +438,28 @@ int claw_kernel_run(struct claw_kernel *k)
 
         for (i = 0; i < nfds; i++) {
             if (events[i].data.fd == k->sock_fd) {
-                /* New connection */
+                /* New connection — add to epoll for persistent I/O */
                 int client = accept4(k->sock_fd, NULL, NULL,
-                                     SOCK_CLOEXEC);
-                if (client >= 0)
-                    handle_client(k, client);
+                                     SOCK_NONBLOCK | SOCK_CLOEXEC);
+                if (client >= 0) {
+                    struct epoll_event ev = {
+                        .events = EPOLLIN | EPOLLHUP | EPOLLERR,
+                        .data.fd = client
+                    };
+                    if (epoll_ctl(k->epoll_fd, EPOLL_CTL_ADD,
+                                  client, &ev) < 0) {
+                        close(client);
+                    }
+                }
+            } else {
+                /* Data from an existing client connection */
+                if (events[i].events & EPOLLIN) {
+                    if (handle_client_data(k, events[i].data.fd) < 0)
+                        close_client(k, events[i].data.fd);
+                }
+                if (events[i].events & (EPOLLHUP | EPOLLERR)) {
+                    close_client(k, events[i].data.fd);
+                }
             }
         }
 
@@ -433,6 +498,8 @@ void claw_kernel_shutdown(struct claw_kernel *k)
             claw_ext_unload(k, k->extensions[i].id);
     }
 
+    if (k->fwd_fd >= 0)
+        close(k->fwd_fd);
     if (k->epoll_fd >= 0)
         close(k->epoll_fd);
     if (k->sock_fd >= 0)
