@@ -225,6 +225,120 @@ static void handle_api_request(struct openclaw_runtime *rt, int client_fd)
     close(client_fd);
 }
 
+/*
+ * Check if a named agent has been deployed already.
+ */
+static int is_deployed(const int *deployed, int count,
+                       struct openclaw_runtime *rt, const char *name)
+{
+    for (int i = 0; i < count; i++) {
+        if (strcmp(rt->manifests[deployed[i]].name, name) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/*
+ * Find manifest index by name. Returns -1 if not found.
+ */
+static int find_manifest(struct openclaw_runtime *rt, const char *name)
+{
+    for (int i = 0; i < rt->manifest_count; i++) {
+        if (strcmp(rt->manifests[i].name, name) == 0)
+            return i;
+    }
+    return -1;
+}
+
+/*
+ * Deploy auto_start agents in dependency order.
+ *
+ * Strategy: iterative resolution. On each pass, deploy agents whose
+ * dependencies have all been deployed. Repeat until no progress is
+ * made (cycle or missing dependency).
+ *
+ * This is simple topological sort without requiring a graph library.
+ * For the expected number of agents (<100), O(n^2) is fine.
+ */
+static void deploy_in_order(struct openclaw_runtime *rt)
+{
+    int deployed[CLAW_MAX_AGENTS];
+    int deployed_count = 0;
+    int total_auto = 0;
+
+    for (int i = 0; i < rt->manifest_count; i++) {
+        if (rt->manifests[i].auto_start)
+            total_auto++;
+    }
+
+    if (total_auto == 0)
+        return;
+
+    int progress = 1;
+    while (progress && deployed_count < total_auto) {
+        progress = 0;
+
+        for (int i = 0; i < rt->manifest_count; i++) {
+            if (!rt->manifests[i].auto_start)
+                continue;
+
+            /* Skip already deployed */
+            int already = 0;
+            for (int d = 0; d < deployed_count; d++) {
+                if (deployed[d] == i) { already = 1; break; }
+            }
+            if (already)
+                continue;
+
+            /* Check if all dependencies are deployed */
+            const struct openclaw_manifest *m = &rt->manifests[i];
+            int deps_met = 1;
+
+            for (int d = 0; d < m->depends_count; d++) {
+                if (!is_deployed(deployed, deployed_count,
+                                 rt, m->depends_on[d])) {
+                    if (find_manifest(rt, m->depends_on[d]) < 0) {
+                        rt_log("warning: %s depends on '%s' which has "
+                               "no manifest - deploying anyway",
+                               m->name, m->depends_on[d]);
+                        continue;
+                    }
+                    deps_met = 0;
+                    break;
+                }
+            }
+
+            if (deps_met) {
+                if (m->depends_count > 0)
+                    rt_log("deploying %s (dependencies satisfied)", m->name);
+                openclaw_deploy_manifest(rt, m);
+                deployed[deployed_count++] = i;
+                progress = 1;
+            }
+        }
+    }
+
+    /* Report any agents that couldn't be deployed */
+    for (int i = 0; i < rt->manifest_count; i++) {
+        if (!rt->manifests[i].auto_start)
+            continue;
+        int found = 0;
+        for (int d = 0; d < deployed_count; d++) {
+            if (deployed[d] == i) { found = 1; break; }
+        }
+        if (!found) {
+            rt_log("ERROR: cannot deploy %s - unresolved dependencies:",
+                   rt->manifests[i].name);
+            for (int d = 0; d < rt->manifests[i].depends_count; d++) {
+                if (!is_deployed(deployed, deployed_count,
+                                 rt, rt->manifests[i].depends_on[d])) {
+                    rt_log("  missing: %s", rt->manifests[i].depends_on[d]);
+                }
+            }
+        }
+    }
+}
+
 int openclaw_run(struct openclaw_runtime *rt)
 {
     struct epoll_event events[32];
@@ -234,11 +348,8 @@ int openclaw_run(struct openclaw_runtime *rt)
     /* Load manifests from default directory */
     openclaw_load_manifests_dir(rt, OPENCLAW_MANIFESTS_DIR);
 
-    /* Auto-deploy agents marked with auto_start */
-    for (int i = 0; i < rt->manifest_count; i++) {
-        if (rt->manifests[i].auto_start)
-            openclaw_deploy_manifest(rt, &rt->manifests[i]);
-    }
+    /* Deploy auto_start agents respecting dependency ordering */
+    deploy_in_order(rt);
 
     rt_log("runtime ready (%d manifests loaded)", rt->manifest_count);
 

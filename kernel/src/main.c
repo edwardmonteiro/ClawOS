@@ -23,6 +23,7 @@
 #include <sys/wait.h>
 
 #include "claw/kernel.h"
+#include "claw/ipc.h"
 
 static struct claw_kernel kernel;
 static volatile int got_signal = 0;
@@ -98,6 +99,153 @@ static void ensure_dirs(void)
     mkdir(CLAWD_CGROUP_ROOT, 0755);
 }
 
+/*
+ * Send a response back to the requesting client.
+ * Used for kernel-handled requests (resolve, agent.create, etc.)
+ */
+static int send_response(int client_fd, const struct claw_msg *req,
+                         const void *data, uint32_t len)
+{
+    size_t total = sizeof(struct claw_msg) + len;
+    struct claw_msg *resp = calloc(1, total);
+    if (!resp)
+        return CLAW_ERR_NOMEM;
+
+    resp->id = req->id;
+    resp->type = CLAW_MSG_RESPONSE;
+    resp->src = 0; /* from kernel */
+    resp->dst = req->src;
+    strncpy(resp->topic, req->topic, CLAW_MAX_NAME - 1);
+    resp->len = len;
+    if (data && len > 0)
+        memcpy(resp->data, data, len);
+
+    ssize_t n = write(client_fd, resp, total);
+    free(resp);
+    return n > 0 ? CLAW_OK : CLAW_ERR_IO;
+}
+
+/*
+ * Send an error response with a short reason string.
+ */
+static void send_error(int client_fd, const struct claw_msg *req,
+                       const char *reason)
+{
+    send_response(client_fd, req, reason, strlen(reason) + 1);
+}
+
+/*
+ * Forward a message from the kernel socket to an agent's IPC socket.
+ * The kernel acts as the router: it resolves the destination agent's
+ * datagram socket path and delivers the message there.
+ */
+static int forward_to_agent(const struct claw_agent *dst,
+                            const struct claw_msg *msg, size_t msg_total)
+{
+    struct sockaddr_un addr;
+    char dst_path[CLAW_MAX_PATH];
+    int fd;
+    ssize_t n;
+
+    snprintf(dst_path, sizeof(dst_path),
+             "%s/%lu.sock", CLAW_IPC_SOCKET_DIR, dst->id);
+
+    fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return CLAW_ERR_IO;
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, dst_path, sizeof(addr.sun_path) - 1);
+
+    n = sendto(fd, msg, msg_total, 0,
+               (struct sockaddr *)&addr, sizeof(addr));
+    close(fd);
+
+    return n > 0 ? CLAW_OK : CLAW_ERR_IO;
+}
+
+/*
+ * Handle a name resolution request.
+ * topic = "resolve", data = agent name (null-terminated string).
+ * Responds with the agent ID (uint64_t) or error.
+ */
+static void handle_resolve(struct claw_kernel *k, int client_fd,
+                           const struct claw_msg *msg)
+{
+    if (msg->len == 0) {
+        send_error(client_fd, msg, "empty name");
+        return;
+    }
+
+    char name[CLAW_MAX_NAME] = {0};
+    size_t copy = msg->len < CLAW_MAX_NAME - 1 ? msg->len : CLAW_MAX_NAME - 1;
+    memcpy(name, msg->data, copy);
+
+    struct claw_agent *agent = claw_agent_find_by_name(k, name);
+    if (!agent) {
+        claw_log(CLAW_LOG_DEBUG, "resolve: '%s' not found", name);
+        send_error(client_fd, msg, "not found");
+        return;
+    }
+
+    claw_log(CLAW_LOG_DEBUG, "resolve: '%s' -> id=%lu state=%d",
+             name, agent->id, agent->state);
+    send_response(client_fd, msg, &agent->id, sizeof(agent->id));
+}
+
+/*
+ * Handle a "list" request.
+ * Returns a packed array of {id, name, state} for all live agents.
+ */
+struct agent_info {
+    claw_aid_t              id;
+    char                    name[CLAW_MAX_NAME];
+    enum claw_agent_state   state;
+};
+
+static void handle_list_agents(struct claw_kernel *k, int client_fd,
+                               const struct claw_msg *msg)
+{
+    struct agent_info buf[CLAW_MAX_AGENTS];
+    int count = 0;
+
+    for (int i = 0; i < k->agent_count; i++) {
+        if (k->agents[i].state == CLAW_AGENT_DEAD)
+            continue;
+        buf[count].id = k->agents[i].id;
+        strncpy(buf[count].name, k->agents[i].name, CLAW_MAX_NAME - 1);
+        buf[count].state = k->agents[i].state;
+        count++;
+    }
+
+    send_response(client_fd, msg, buf,
+                  count * sizeof(struct agent_info));
+}
+
+/*
+ * Handle a "ready" signal from an agent.
+ * Agents call this after initialization to signal they are ready
+ * to receive messages. This is used by lifecycle ordering.
+ */
+static void handle_agent_ready(struct claw_kernel *k, int client_fd,
+                               const struct claw_msg *msg)
+{
+    struct claw_agent *agent = claw_agent_find(k, msg->src);
+    if (!agent) {
+        send_error(client_fd, msg, "unknown agent");
+        return;
+    }
+
+    if (agent->state == CLAW_AGENT_RUNNING) {
+        agent->state = CLAW_AGENT_READY;
+        claw_log(CLAW_LOG_INFO, "agent %s (id=%lu) signaled ready",
+                 agent->name, agent->id);
+    }
+
+    send_response(client_fd, msg, "ok", 3);
+}
+
 static void handle_client(struct claw_kernel *k, int client_fd)
 {
     char buf[CLAW_MAX_MSG_SIZE];
@@ -109,35 +257,69 @@ static void handle_client(struct claw_kernel *k, int client_fd)
         return;
     }
 
-    /* Parse incoming message as claw_msg */
     if ((size_t)n < sizeof(struct claw_msg)) {
         close(client_fd);
         return;
     }
 
     struct claw_msg *msg = (struct claw_msg *)buf;
+    size_t msg_total = sizeof(struct claw_msg) + msg->len;
 
     switch (msg->type) {
     case CLAW_MSG_REQUEST:
         claw_log(CLAW_LOG_DEBUG, "request from agent %lu: %s",
                  msg->src, msg->topic);
-        /* Route to destination agent or handle internally */
-        if (msg->dst != 0) {
+
+        /* Kernel-handled requests */
+        if (strcmp(msg->topic, "resolve") == 0) {
+            handle_resolve(k, client_fd, msg);
+        } else if (strcmp(msg->topic, "agent.list") == 0) {
+            handle_list_agents(k, client_fd, msg);
+        } else if (strcmp(msg->topic, "agent.ready") == 0) {
+            handle_agent_ready(k, client_fd, msg);
+        } else if (msg->dst != 0) {
+            /* Route to destination agent */
             struct claw_agent *dst = claw_agent_find(k, msg->dst);
-            if (dst) {
-                /* Forward message to destination */
-                claw_log(CLAW_LOG_DEBUG, "routing to agent %s", dst->name);
+            if (!dst || dst->state == CLAW_AGENT_DEAD) {
+                claw_log(CLAW_LOG_WARN, "route failed: agent %lu not found",
+                         msg->dst);
+                send_error(client_fd, msg, "agent not found");
+            } else {
+                int rc = forward_to_agent(dst, msg, msg_total);
+                if (rc != CLAW_OK) {
+                    claw_log(CLAW_LOG_WARN,
+                             "route failed: cannot reach agent %s",
+                             dst->name);
+                    send_error(client_fd, msg, "delivery failed");
+                } else {
+                    claw_log(CLAW_LOG_DEBUG, "routed to agent %s (id=%lu)",
+                             dst->name, dst->id);
+                }
             }
+        } else {
+            send_error(client_fd, msg, "unhandled topic");
         }
         break;
 
     case CLAW_MSG_EVENT:
         claw_log(CLAW_LOG_DEBUG, "event from agent %lu: %s",
                  msg->src, msg->topic);
+        /* Forward events to the destination if specified, or ignore
+           (bus handles broadcast events, kernel handles point-to-point) */
+        if (msg->dst != 0) {
+            struct claw_agent *dst = claw_agent_find(k, msg->dst);
+            if (dst && dst->state != CLAW_AGENT_DEAD)
+                forward_to_agent(dst, msg, msg_total);
+        }
         break;
 
     case CLAW_MSG_SIGNAL:
         claw_log(CLAW_LOG_DEBUG, "signal from agent %lu", msg->src);
+        if (msg->dst != 0) {
+            struct claw_agent *dst = claw_agent_find(k, msg->dst);
+            if (dst && dst->state != CLAW_AGENT_DEAD)
+                forward_to_agent(dst, msg, msg_total);
+        }
         break;
 
     default:
