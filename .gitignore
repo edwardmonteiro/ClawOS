@@ -7,3 +7,4 @@ openclaw/openclaw-runtime
 cli/claw
 */obj/
 *.img
+bench/bench_msg
