@@ -62,7 +62,7 @@ int claw_bus_init(struct claw_bus *bus)
         bus->topic_heads[i] = -1;
     bus->wildcard_head = -1;
 
-    bus->sock_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    bus->sock_fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (bus->sock_fd < 0)
         return -1;
 
@@ -157,7 +157,7 @@ static void deliver_chain(struct claw_bus *bus, int head,
         int next = sub->next;
 
         if (sub->active && sub->agent_id != msg->src) {
-            ssize_t n = send(sub->fd, msg, total, MSG_NOSIGNAL);
+            ssize_t n = send(sub->fd, msg, total, MSG_DONTWAIT | MSG_NOSIGNAL);
             if (n < 0)
                 sub->active = 0;
         }
@@ -192,7 +192,7 @@ static void deliver_to_subscribers(struct claw_bus *bus,
             /* Hash collision: verify exact topic match */
             if (sub->active && sub->agent_id != msg->src &&
                 strcmp(sub->topic, msg->topic) == 0) {
-                ssize_t n = send(sub->fd, msg, total, MSG_NOSIGNAL);
+                ssize_t n = send(sub->fd, msg, total, MSG_DONTWAIT | MSG_NOSIGNAL);
                 if (n < 0)
                     sub->active = 0;
             }
@@ -296,7 +296,7 @@ int claw_bus_connect(void)
     struct sockaddr_un addr;
     int fd;
 
-    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (fd < 0)
         return -1;
 
@@ -335,7 +335,7 @@ int claw_bus_subscribe(int bus_fd, const char *topic, claw_aid_t agent_id)
     memcpy(msg->data, topic, topic_len);
     msg->data[topic_len] = '\0';
 
-    ssize_t n = write(bus_fd, msg, msg_size);
+    ssize_t n = send(bus_fd, msg, msg_size, MSG_NOSIGNAL);
     return n > 0 ? 0 : -1;
 }
 
@@ -354,7 +354,7 @@ int claw_bus_unsubscribe(int bus_fd, const char *topic, claw_aid_t agent_id)
     memcpy(msg->data, topic, topic_len);
     msg->data[topic_len] = '\0';
 
-    ssize_t n = write(bus_fd, msg, msg_size);
+    ssize_t n = send(bus_fd, msg, msg_size, MSG_NOSIGNAL);
     return n > 0 ? 0 : -1;
 }
 
@@ -381,7 +381,7 @@ int claw_bus_publish(int bus_fd, const char *topic,
     if (data && len > 0)
         memcpy(msg->data, data, len);
 
-    ssize_t n = write(bus_fd, msg, msg_size);
+    ssize_t n = send(bus_fd, msg, msg_size, MSG_NOSIGNAL);
     if (heap)
         free(msg);
     return n > 0 ? 0 : -1;

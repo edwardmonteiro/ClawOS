@@ -50,7 +50,7 @@ static int setup_socket(struct claw_kernel *k)
     struct sockaddr_un addr;
     int fd;
 
-    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0)
         return CLAW_ERR_IO;
 
@@ -138,7 +138,7 @@ static int send_response(int client_fd, const struct claw_msg *req,
     if (data && len > 0)
         memcpy(resp->data, data, len);
 
-    ssize_t n = write(client_fd, resp, total);
+    ssize_t n = send(client_fd, resp, total, MSG_DONTWAIT | MSG_NOSIGNAL);
     if (heap)
         free(resp);
     return n > 0 ? CLAW_OK : CLAW_ERR_IO;
@@ -176,7 +176,7 @@ static int forward_to_agent(struct claw_kernel *k,
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, dst_path, sizeof(addr.sun_path) - 1);
 
-    n = sendto(k->fwd_fd, msg, msg_total, 0,
+    n = sendto(k->fwd_fd, msg, msg_total, MSG_DONTWAIT | MSG_NOSIGNAL,
                (struct sockaddr *)&addr, sizeof(addr));
 
     return n > 0 ? CLAW_OK : CLAW_ERR_IO;

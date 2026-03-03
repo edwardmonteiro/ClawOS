@@ -9,7 +9,7 @@ DESTDIR ?=
 
 COMPONENTS = kernel init bus openclaw cli extensions
 
-.PHONY: all clean install image $(COMPONENTS)
+.PHONY: all clean install image bench $(COMPONENTS)
 
 all: $(COMPONENTS)
 
@@ -31,9 +31,15 @@ cli:
 extensions:
 	$(MAKE) -C extensions CC=$(CC)
 
+bench:
+	$(MAKE) -C bench CC=$(CC)
+
+bench-run: bench
+	$(MAKE) -C bench run
+
 clean:
-	@for dir in $(COMPONENTS); do \
-		$(MAKE) -C $$dir clean; \
+	@for dir in $(COMPONENTS) bench; do \
+		$(MAKE) -C $$dir clean 2>/dev/null; true; \
 	done
 
 install: all
@@ -53,6 +59,8 @@ help:
 	@echo "  openclaw    Build OpenClaw runtime"
 	@echo "  cli         Build CLI tool (claw)"
 	@echo "  extensions  Build extensions"
+	@echo "  bench       Build benchmarks"
+	@echo "  bench-run   Build and run benchmarks"
 	@echo "  clean       Clean all build artifacts"
 	@echo "  install     Install to DESTDIR"
 	@echo "  image       Build bootable disk image"
