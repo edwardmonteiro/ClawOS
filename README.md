@@ -1,166 +1,107 @@
-# ClawOS
+# ClawOS Native
 
-**The OS for Modern Agents**
+**Experimental agent-first operating system for old Intel Mac minis (2006-2011, 4 GB RAM).**
 
-A super lightweight kernel layer on top of Linux that makes OpenClaw a powerful integration engine out of the box. ClawOS provides the minimal infrastructure needed to run, orchestrate, and scale AI agents with native OS-level support.
+ClawOS Native is a **freestanding x86 kernel written from scratch in C and assembly**. The BIOS demo is **not Linux or macOS**. It is **not a complete operating system** and **does not yet run OpenClaw, Node.js or an LLM**.
 
-## Architecture
+**Status: v0.2 proof of concept.** Images have passed **structural verification only**. Neither QEMU boot nor physical Mac mini boot has been demonstrated. Do not erase your Mac disk.
 
-```
-┌─────────────────────────────────────────────┐
-│                  claw CLI                   │
-├─────────────────────────────────────────────┤
-│            OpenClaw Runtime                 │
-│   (manifests · registry · API gateway)      │
-├──────────────────┬──────────────────────────┤
-│    claw-bus      │      Extensions (.so)    │
-│  (pub/sub IPC)   │    (dynamic plugins)     │
-├──────────────────┴──────────────────────────┤
-│              clawd (kernel daemon)          │
-│  (agent lifecycle · IPC · sandbox · cgroups)│
-├─────────────────────────────────────────────┤
-│              claw-init (PID 1)              │
-├─────────────────────────────────────────────┤
-│              Linux Kernel                   │
-└─────────────────────────────────────────────┘
-```
+## What is available
 
-## Components
+| Component | Status | Limitation |
+|---|---|---|
+| Custom BIOS boot sector | Compiled, structurally checked | Requires BIOS/CSM, not proven on Apple |
+| x86 32-bit protected-mode kernel | Compiled | No paging, scheduler, or processes |
+| VGA text shell and PS/2 keyboard polling | Implemented | Not boot or hardware-tested |
+| Agent intent classification | Implemented | Deterministic keywords, not generative AI |
+| In-RAM task approval queue | Implemented | Approve does NOT execute actions |
+| Bootable-format floppy IMG and El Torito ISO | Built/verified | No verified successful boot |
+| IA32 EFI and x64 EFI executables | Built/verified | **Diagnostic only**, not EFI kernel loader |
+| 64 MiB EFI FAT32 USB image | Built/verified | Diagnostic only, not an OS installer |
+| Disk filesystem, drivers, network, TLS | Not implemented | Needed for persistent agent tools |
+| Upstream OpenClaw/Node runtime | Not implemented | Major runtime/POSIX compatibility required |
 
-| Component | Description |
-|-----------|-------------|
-| **claw-init** | Minimal init system (PID 1). Mounts filesystems, starts core services, auto-restarts on crash. |
-| **clawd** | Kernel daemon. Manages agent lifecycles, cgroup sandboxing, namespace isolation, and extension loading. |
-| **claw-bus** | Pub/sub message bus. High-performance inter-agent communication via Unix domain sockets and epoll. |
-| **openclaw-runtime** | OpenClaw integration engine. Parses TOML manifests, deploys agents, provides API gateway. |
-| **claw** | CLI tool. Status, agent management, deployment, extension control. |
-| **Extension SDK** | Build plugins as `.so` shared libraries loaded dynamically by clawd. |
+## Current architecture
 
-## Quick Start
+    BIOS/CSM -> custom 16-bit stage 0 -> protected mode x86 kernel
+             -> VGA terminal + PS/2 polling -> ClawOS shell
+             -> keyword router -> request queue in RAM -> human approval (no execution)
 
-### Build
+Separate EFI32/EFI64 binaries test firmware entry only. They do **not** load the kernel.
 
-```sh
-make            # Build all components
-make kernel     # Build only clawd
-make install    # Install to system (use DESTDIR= for staging)
-```
+## Build
 
-### Create an Agent
+On a Linux development machine, install GNU make, GCC with 32-bit freestanding compilation support, binutils, Python 3, Clang and lld-link. These are **host development tools**; ClawOS itself does not ship Linux.
 
-Write a manifest file (`my-agent.toml`):
+    make
+    make efi
+    make verify
 
-```toml
-[agent]
-name = "my-agent"
-version = "1.0.0"
-description = "My first ClawOS agent"
-exec = "/usr/lib/claw/agents/my-agent"
+Outputs (ignored from Git, generated in build/):
 
-[resources]
-memory = "256M"
-cpu_shares = 100
+    build/clawos-native-bios.img     - 1.44 MiB legacy BIOS floppy image
+    build/clawos-native-bios.iso     - ~1.5 MiB El Torito BIOS ISO
+    build/clawos-efi-probe-usb.img   - 64 MiB EFI32 + EFI64 diagnostic media
+    build/BOOTIA32.EFI              - UEFI32 diagnostic
+    build/BOOTX64.EFI               - UEFI64 diagnostic
 
-[capabilities]
-net = true
-ipc = true
-bus = true
-openclaw = true
+The GitHub Actions workflow builds and performs structural checks. On success, the images are available as temporary workflow artifacts.
 
-[lifecycle]
-auto_start = true
-restart_on_failure = true
-max_restarts = 5
+### Test in QEMU first
 
-[bus]
-subscribe = "events.user, events.system"
+After building, test interactively on a computer running QEMU:
 
-[environment]
-LOG_LEVEL = "info"
-```
+    qemu-system-i386 -m 512 -drive file=build/clawos-native-bios.img,if=floppy,format=raw
 
-Deploy it:
+Or:
 
-```sh
-claw deploy my-agent.toml
-claw status
-claw agent list
-```
+    qemu-system-i386 -m 512 -cdrom build/clawos-native-bios.iso -boot d
 
-### Build a Bootable Image
+Try shell commands: help, about, hardware, status, skills, agent organizar arquivos, tasks, approve, reject.
 
-```sh
-sudo make image    # Creates clawos.img (~256MB)
+The agent command **does not** modify files, access a model or execute arbitrary programs. Task requests disappear at reboot.
 
-# Test with QEMU
-qemu-system-x86_64 -m 512 -drive file=clawos.img,format=raw -nographic
-```
+**Verification limits:** make verify checks BIOS signature and kernel payload, ISO/El Torito structures, FAT32 layout and EFI PE headers. It cannot prove boot compatibility.
 
-## Extension Development
+## Old Mac mini support
 
-Create a plugin in C:
+Some 2006 Mac minis use 32-bit CPUs, while later Intel models have 64-bit CPUs. Apple EFI firmware may be 32- or 64-bit and may lack usable BIOS compatibility boot for custom USB images.
 
-```c
-#include <claw_ext.h>
+| Boot mode | Image | Support |
+|---|---|---|
+| BIOS/CSM legacy | BIOS ISO or floppy IMG | Candidate, unverified on Mac |
+| IA32 EFI | FAT32 USB diagnostic IMG | Boot probe only, unverified on Mac |
+| x64 EFI | FAT32 USB diagnostic IMG | Boot probe only, unverified on Mac |
 
-const char *claw_ext_name(void)  { return "my-extension"; }
-const char *claw_ext_version(void) { return "1.0.0"; }
+**Do not format or replace the internal drive.** Keep macOS bootable and identify the exact model first. Use a removable medium only after safely confirming the boot mode.
 
-int claw_ext_init(void) {
-    /* Called when clawd loads the extension */
-    return 0;
-}
+See [Mac mini test plan](docs/MAC-MINI.md) and [architecture/roadmap](docs/ARCHITECTURE.md).
 
-void claw_ext_cleanup(void) {
-    /* Called on unload/shutdown */
-}
+## Roadmap
 
-int claw_ext_handle_msg(const struct claw_msg *msg,
-                        void *reply, uint32_t *reply_len) {
-    /* Handle messages directed at this extension */
-    return CLAW_OK;
-}
-```
+1. QEMU execution with captured serial or VGA evidence.
+2. Mac-specific EFI firmware diagnosis; implement EFI32/x64 kernel loader.
+3. Memory map, paging, interrupts, timer and hardware drivers.
+4. Filesystem, persistent state, isolated processes, network and TLS.
+5. Secure native AI inference transport and executable agent capabilities.
+6. Evaluate OpenClaw-compatible gateway protocol or Node/POSIX compatibility.
 
-Build and install:
+The target is **minimal memory use with cloud-hosted model inference**. No measured RAM or boot-time claims are made yet.
 
-```sh
-gcc -shared -fPIC -o my-extension.so my-extension.c
-cp my-extension.so /usr/lib/claw/extensions/
-```
+## Repository layout
 
-## Design Principles
+    boot/               original BIOS boot sector and mode transition
+    kernel/             freestanding kernel and linker script
+    uefi/               EFI firmware diagnostic code
+    tools/              image generation and structural verification
+    docs/               compatibility and roadmap
+    .github/workflows/  CI build and image artifacts
+    Makefile            build definitions
 
-- **Everything is an agent** - Processes are managed as agents with declarative manifests
-- **OpenClaw native** - Integration engine is a first-class citizen, not bolted on
-- **Capability-based security** - Agents declare what they need; everything else is denied
-- **Minimal footprint** - Alpine Linux base, musl-compatible, boots in seconds
-- **Message-driven** - Agents communicate via high-performance pub/sub bus
-- **Extensible** - Dynamic plugin system for adding capabilities at runtime
+## Previous Linux-based ClawOS
 
-## Project Structure
+The former main branch was preserved at [archive/linux-agent-runtime-2026-10](../../tree/archive/linux-agent-runtime-2026-10). The new main is intentionally a different project: a true bare-metal kernel experiment rather than a Linux-based agent runtime.
 
-```
-ClawOS/
-├── kernel/          # clawd - kernel daemon
-│   ├── src/         #   main, process, ipc, sandbox, extension, log
-│   └── include/     #   claw/types.h, kernel.h, ipc.h
-├── init/            # claw-init - init system (PID 1)
-├── bus/             # claw-bus - message bus
-├── openclaw/        # OpenClaw runtime
-│   ├── src/         #   runtime, manifest parser
-│   └── include/     #   openclaw/runtime.h, manifest.h
-├── cli/             # claw CLI tool
-├── extensions/      # Extension SDK and examples
-│   └── sdk/
-│       ├── include/ #   claw_ext.h
-│       └── examples/#   hello extension
-├── config/          # Default configurations
-├── scripts/         # Build, install, image creation
-├── rootfs/          # Root filesystem overlay
-└── Makefile         # Top-level build
-```
+## Security and license
 
-## License
-
-Apache License 2.0
+All scripts write **files under build/**, not physical disks. Do not store API keys in Git or firmware images. The new source is experimental; license terms for the rewritten implementation should be reviewed before redistribution.

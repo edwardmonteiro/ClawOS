@@ -1,0 +1,29 @@
+name: Build ClawOS Native
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential binutils clang lld python3
+      - name: Build and structurally verify
+        run: make verify
+      - name: Upload experimental boot images
+        uses: actions/upload-artifact@v4
+        with:
+          name: clawos-native-v0-2-images
+          path: |
+            build/clawos-native-bios.img
+            build/clawos-native-bios.iso
+            build/clawos-efi-probe-usb.img
+            build/BOOTIA32.EFI
+            build/BOOTX64.EFI
+          if-no-files-found: error
+          retention-days: 14

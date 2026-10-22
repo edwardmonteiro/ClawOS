@@ -1,9 +1,10 @@
+build/
 *.o
-*.so
-kernel/clawd
-init/claw-init
-bus/claw-bus
-openclaw/openclaw-runtime
-cli/claw
-*/obj/
+*.obj
+*.elf
+*.bin
 *.img
+*.iso
+*.EFI
+__pycache__/
+.DS_Store
